@@ -43,6 +43,7 @@ const App = () => {
 
     return () => {
       socket.disconnect();
+      setIsRecording(false);
     };
   }, []);
 
@@ -55,7 +56,7 @@ const App = () => {
       });
       mediaRecorderRef.current = mediaRecorder;
 
-      mediaRecorder.start(250); // 250ms chunks
+      mediaRecorder.start(250);
 
       setIsRecording(true);
       setStatus("Recording");
@@ -83,10 +84,7 @@ const App = () => {
   }
 
   function stopRecording() {
-    if (
-      mediaRecorderRef.current &&
-      mediaRecorderRef.current.state !== "inactive"
-    ) {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       mediaRecorderRef.current.stop();
     }
   }

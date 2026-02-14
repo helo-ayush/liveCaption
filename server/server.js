@@ -1,9 +1,10 @@
-// server.js
+require('dotenv').config() 
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
 
+console.log("Deepgram API Key:", process.env.DEEPGRAM_API_KEY ? "Loaded" : "Missing");
 
 const app = express();
 const server = http.createServer(app);
@@ -11,7 +12,8 @@ const io = new Server(server, {
   cors: { origin: "*" },
 });
 
-const deepgram = createClient("94f2f8ab8a3beb7b92eb571e36b6af1348027446");
+// const deepgram = createClient("94f2f8ab8a3beb7b92eb571e36b6af1348027446");
+const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
 io.on("connection", async (socket) => {
   console.log("Client connected:", socket.id);
