@@ -1,10 +1,10 @@
-require('dotenv').config() 
+require('dotenv').config()
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
-
-console.log("Deepgram API Key:", process.env.DEEPGRAM_API_KEY ? "Loaded" : "Missing");
+const { transliterate } = require("transliteration");
+const commonHinglishMap = require("./hinglishMap");
 
 const app = express();
 const server = http.createServer(app);
@@ -12,7 +12,7 @@ const io = new Server(server, {
   cors: { origin: "*" },
 });
 
-// const deepgram = createClient("94f2f8ab8a3beb7b92eb571e36b6af1348027446");
+// Initialize Deepgram
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
 io.on("connection", async (socket) => {
@@ -21,7 +21,7 @@ io.on("connection", async (socket) => {
   // Create Deepgram live connection
   const dgConnection = deepgram.listen.live({
     model: "nova-3",
-    language: "multi",
+    language: "multi", // Detects Hindi/English automatically
     smart_format: true,
     punctuate: true,
     interim_results: true,
@@ -35,9 +35,36 @@ io.on("connection", async (socket) => {
 
   dgConnection.on(LiveTranscriptionEvents.Transcript, (data) => {
     const alt = data.channel?.alternatives?.[0];
-    const text = alt?.transcript || "";
+    let text = alt?.transcript || "";
+
     if (text) {
-      console.log("DG transcript:", text);
+      if (/[\u0900-\u097F]/.test(text)) {
+        try {
+          text = text.split(" ").map(word => {
+            const match = word.match(/^([^\u0900-\u097F\w]*)([\u0900-\u097F\w]+)([^\u0900-\u097F\w]*)$/);
+            if (!match) return word;
+
+            const [_, prefix, core, suffix] = match;
+
+            let translated = commonHinglishMap[core];
+            if (!translated) {
+              if (/[\u0900-\u097F]/.test(core)) {
+                translated = transliterate(core).toLowerCase();
+              } else {
+                translated = core;
+              }
+            }
+            return prefix + translated + suffix;
+          }).join(" ");
+
+          if (data.channel && data.channel.alternatives && data.channel.alternatives[0]) {
+            data.channel.alternatives[0].transcript = text;
+          }
+        } catch (e) {
+          console.error("Transliteration error:", e);
+        }
+      }
+      console.log("Transcript:", text);
     }
     socket.emit("transcript", data);
   });
@@ -72,3 +99,4 @@ io.on("connection", async (socket) => {
 server.listen(3000, () => {
   console.log("Server running on http://localhost:3000");
 });
+
