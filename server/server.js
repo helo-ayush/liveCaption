@@ -1,16 +1,17 @@
-require('dotenv').config() 
+
+
+require('dotenv').config();
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
-
-console.log("Deepgram API Key:", process.env.DEEPGRAM_API_KEY ? "Loaded" : "Missing");
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
 });
+
 
 // const deepgram = createClient("94f2f8ab8a3beb7b92eb571e36b6af1348027446");
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
@@ -26,11 +27,21 @@ io.on("connection", async (socket) => {
     punctuate: true,
     interim_results: true,
     numerals: true,
+    vad_events: true,
+    endpointing: 400,
+    interim_results: true,
+    utterance_end_ms: 1000,
   });
+
+  let keepAlive;
 
   dgConnection.on(LiveTranscriptionEvents.Open, () => {
     console.log("Deepgram connected");
     socket.emit("dg-ready");
+    
+    keepAlive = setInterval(() => {
+      dgConnection.keepAlive();
+    }, 8000);
   });
 
   dgConnection.on(LiveTranscriptionEvents.Transcript, (data) => {

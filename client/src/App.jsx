@@ -1,4 +1,3 @@
-// App.jsx
 import React, { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 
@@ -11,11 +10,16 @@ const App = () => {
   const [status, setStatus] = useState("Disconnected");
 
   useEffect(() => {
-    const socket = io("http://localhost:3000");
+    const socket = io("http://localhost:3000", {
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      timeout: 10000,
+    });
     socketRef.current = socket;
 
     socket.on("connect", () => {
-      setStatus("Connected to Server");
+      setStatus("Connected");
       console.log("Connected to server");
     });
 
@@ -49,6 +53,12 @@ const App = () => {
 
   async function startRecording() {
     try {
+      if (mediaRecorderRef.current) {
+        mediaRecorderRef.current.resume();
+        setIsRecording(true);
+        setStatus("Recording");
+        return;
+      }
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
       const mediaRecorder = new MediaRecorder(stream, {
@@ -84,8 +94,10 @@ const App = () => {
   }
 
   function stopRecording() {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      mediaRecorderRef.current.stop();
+    if (mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.pause();
+      setIsRecording(false);
+      setStatus("Paused");
     }
   }
 
