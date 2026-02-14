@@ -1,33 +1,20 @@
-<<<<<<< HEAD
-require('dotenv').config()
-=======
 // Imports Statement
 require('dotenv').config();
->>>>>>> 49937048576d591307ce373e511792fb06c5ffb5
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
-<<<<<<< HEAD
 const { transliterate } = require("transliteration");
 const commonHinglishMap = require("./hinglishMap");
 
-=======
-
-// Initializing the Imports
->>>>>>> 49937048576d591307ce373e511792fb06c5ffb5
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
 });
 
-<<<<<<< HEAD
-// Initialize Deepgram
-=======
 
 //  Deepgram Client Created
->>>>>>> 49937048576d591307ce373e511792fb06c5ffb5
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
 
@@ -55,7 +42,7 @@ io.on("connection", async (socket) => {
   dgConnection.on(LiveTranscriptionEvents.Open, () => {
     console.log("Deepgram connected");
     socket.emit("dg-ready");
-    
+
     keepAlive = setInterval(() => {
       dgConnection.keepAlive();
     }, 8000);
@@ -114,7 +101,7 @@ io.on("connection", async (socket) => {
       dgConnection.send(chunk);
     }
   });
-  
+
   // When the Socket Disconnects
   socket.on("disconnect", () => {
     console.log("Client disconnected:", socket.id);
