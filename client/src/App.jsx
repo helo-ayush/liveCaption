@@ -1,21 +1,32 @@
-// App.jsx
 import React, { useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 
 const App = () => {
-  const socketRef = useRef(null);
+  // Variables Defining
+  const socketRef = useRef(null);                                      
   const mediaRecorderRef = useRef(null);
   const [finalTranscript, setFinalTranscript] = useState("");
   const [interimTranscript, setInterimTranscript] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState("Disconnected");
 
+  // Only Runs for the first time to establish the Socket Connection
   useEffect(() => {
-    const socket = io("http://localhost:3000");
-    socketRef.current = socket;
 
+    // Initializing the socket Connection with retryconnection upto infinite time
+    const socket = io("http://localhost:3000", {
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      timeout: 10000,
+    });
+
+    // Saved the Socket in SocketRef useRef var so it will not keep reinitiallizing
+    socketRef.current = socket;
+    
+    // Socket quick notifications
     socket.on("connect", () => {
-      setStatus("Connected to Server");
+      setStatus("Connected");
       console.log("Connected to server");
     });
 
@@ -24,6 +35,7 @@ const App = () => {
       console.log("Deepgram ready");
     });
 
+    // When the socket Returns transcript
     socket.on("transcript", (data) => {
       console.log("Transcript received:", data);
       const alt = data.channel?.alternatives?.[0];
@@ -37,42 +49,57 @@ const App = () => {
       }
     });
 
+    // Notifing the user when socket gets disconnected
     socket.on("disconnect", () => {
       setStatus("Disconnected");
     });
 
+    // Cleaner funtion that will close the socket connection at the end
     return () => {
       socket.disconnect();
       setIsRecording(false);
     };
   }, []);
 
+  // Start Recoding function which records 250ms chunks of the audio from mic input
   async function startRecording() {
     try {
+
+      // Checking if the Recording has already started then instead of create new recording, resume it and return
+      if (mediaRecorderRef.current) {
+        mediaRecorderRef.current.resume();
+        setIsRecording(true);
+        setStatus("Recording");
+        return;
+      }
+
+      //  Creating new recoding Streams input from mic
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
+      // The variable which will actually does the recording, it will be stored inside the useRef so that it wont reinitialize
       const mediaRecorder = new MediaRecorder(stream, {
         mimeType: "audio/webm",
       });
       mediaRecorderRef.current = mediaRecorder;
-
-      mediaRecorder.start(250);
+      mediaRecorder.start(250);  // 250ms audio chunk
 
       setIsRecording(true);
       setStatus("Recording");
 
+      // Builtin ondataavailable function that will run every 250ms
       mediaRecorder.ondataavailable = async (event) => {
         if (
           event.data &&
           event.data.size > 0 &&
           socketRef.current?.connected
         ) {
-          // Convert Blob -> ArrayBuffer so server gets raw bytes
+          // Convert Blob(250ms Chunk) -> ArrayBuffer so server gets raw bytes
           const arrayBuffer = await event.data.arrayBuffer();
           socketRef.current.emit("audio-chunk", arrayBuffer);
         }
       };
 
+      // Updates variables when recording stop
       mediaRecorder.onstop = () => {
         setIsRecording(false);
         setStatus("Stopped");
@@ -83,12 +110,16 @@ const App = () => {
     }
   }
 
+  // A function that will pause the mediaRecorder
   function stopRecording() {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      mediaRecorderRef.current.stop();
+    if (mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.pause();
+      setIsRecording(false);
+      setStatus("Paused");
     }
   }
 
+  // Switch between Resume and Pause Recording
   const toggleRecording = async () => {
     if (!isRecording) {
       await startRecording();
