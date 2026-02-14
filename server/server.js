@@ -1,11 +1,11 @@
-
-
+// Imports Statement
 require('dotenv').config();
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
 
+// Initializing the Imports
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -13,9 +13,11 @@ const io = new Server(server, {
 });
 
 
-// const deepgram = createClient("94f2f8ab8a3beb7b92eb571e36b6af1348027446");
+//  Deepgram Client Created
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
+
+//  Socket Connection Initiate
 io.on("connection", async (socket) => {
   console.log("Client connected:", socket.id);
 
@@ -35,6 +37,7 @@ io.on("connection", async (socket) => {
 
   let keepAlive;
 
+  //  When DeepGram Connection is Established
   dgConnection.on(LiveTranscriptionEvents.Open, () => {
     console.log("Deepgram connected");
     socket.emit("dg-ready");
@@ -44,6 +47,7 @@ io.on("connection", async (socket) => {
     }, 8000);
   });
 
+  //  When Deepgram Return Transcribed Result
   dgConnection.on(LiveTranscriptionEvents.Transcript, (data) => {
     const alt = data.channel?.alternatives?.[0];
     const text = alt?.transcript || "";
@@ -53,10 +57,12 @@ io.on("connection", async (socket) => {
     socket.emit("transcript", data);
   });
 
+  //  Returns Error from DeepGram Server Side
   dgConnection.on(LiveTranscriptionEvents.Error, (err) => {
     console.error("Deepgram error:", err);
   });
 
+  //  Notify when the Deepgram Connection Gets Closed
   dgConnection.on(LiveTranscriptionEvents.Close, () => {
     console.log("Deepgram connection closed");
   });
@@ -67,7 +73,8 @@ io.on("connection", async (socket) => {
       dgConnection.send(chunk);
     }
   });
-
+  
+  // When the Socket Disconnects
   socket.on("disconnect", () => {
     console.log("Client disconnected:", socket.id);
     try {
@@ -79,6 +86,7 @@ io.on("connection", async (socket) => {
     }
   });
 });
+
 
 server.listen(3000, () => {
   console.log("Server running on http://localhost:3000");
