@@ -9,8 +9,20 @@ const commonHinglishMap = require("./hinglishMap");
 
 const app = express();
 const server = http.createServer(app);
+const cors = require("cors");
+
+const allowedOrigins = [process.env.FRONTEND_URL || "http://localhost:5173"];
+
+const corsOptions = {
+  origin: allowedOrigins,
+  methods: ["GET", "POST"],
+  credentials: true
+};
+
+app.use(cors(corsOptions));
+
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: corsOptions,
 });
 
 
@@ -21,6 +33,12 @@ const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 //  Socket Connection Initiate
 io.on("connection", async (socket) => {
   console.log("Client connected:", socket.id);
+
+  // Variables
+  let eng_transcript = "  ";
+  let transcript = "";
+  let eng_interim_results = "";
+  let interim_results = "";
 
   // Create Deepgram live connection
   const dgConnection = deepgram.listen.live({
@@ -48,15 +66,19 @@ io.on("connection", async (socket) => {
     }, 8000);
   });
 
+
+
   //  When Deepgram Return Transcribed Result
   dgConnection.on(LiveTranscriptionEvents.Transcript, (data) => {
     const alt = data.channel?.alternatives?.[0];
-    let text = alt?.transcript || "";
+    const originalText = alt?.transcript || ""; // Capture original before modification
+    let hinglishText = originalText;
 
-    if (text) {
-      if (/[\u0900-\u097F]/.test(text)) {
+    if (originalText) {
+      // Logic for Transliteration (Devanagari -> Hinglish)
+      if (/[\u0900-\u097F]/.test(originalText)) {
         try {
-          text = text.split(" ").map(word => {
+          hinglishText = originalText.split(" ").map(word => {
             const match = word.match(/^([^\u0900-\u097F\w]*)([\u0900-\u097F\w]+)([^\u0900-\u097F\w]*)$/);
             if (!match) return word;
 
@@ -65,6 +87,7 @@ io.on("connection", async (socket) => {
             let translated = commonHinglishMap[core];
             if (!translated) {
               if (/[\u0900-\u097F]/.test(core)) {
+                // Return lower case for transliterated words (e.g. "namaste")
                 translated = transliterate(core).toLowerCase();
               } else {
                 translated = core;
@@ -73,16 +96,43 @@ io.on("connection", async (socket) => {
             return prefix + translated + suffix;
           }).join(" ");
 
+          // Update the data object to send Hinglish to frontend
           if (data.channel && data.channel.alternatives && data.channel.alternatives[0]) {
-            data.channel.alternatives[0].transcript = text;
+            data.channel.alternatives[0].transcript = hinglishText;
           }
         } catch (e) {
           console.error("Transliteration error:", e);
         }
       }
-      console.log("Transcript:", text);
+
+      // Update Accumulators
+      if (data.is_final) {
+        // Append to the full session transcripts
+        // Assuming 'transcript' tracks the Original (Devanagari/Mixed)
+        // Assuming 'eng_transcript' tracks the Hinglish (English Script) 
+        transcript += (" " + originalText);
+        eng_transcript += (" " + hinglishText);
+
+        // Reset interim
+        interim_results = "";
+        eng_interim_results = "";
+      } else {
+        // Update interim (live typing view)
+        interim_results = originalText;
+        eng_interim_results = hinglishText;
+      }
+
+      console.log("Original:", originalText);
+      console.log("Hinglish:", hinglishText);
     }
-    socket.emit("transcript", data);
+
+    // Emit the modified data (containing Hinglish) to the frontend
+    socket.emit("transcript", {
+      transcript,
+      eng_transcript,
+      interim_results,
+      eng_interim_results
+    });
   });
 
   //  Returns Error from DeepGram Server Side
@@ -93,6 +143,7 @@ io.on("connection", async (socket) => {
   //  Notify when the Deepgram Connection Gets Closed
   dgConnection.on(LiveTranscriptionEvents.Close, () => {
     console.log("Deepgram connection closed");
+    clearInterval(keepAlive);
   });
 
   // Receive audio from frontend and forward to Deepgram
@@ -105,6 +156,8 @@ io.on("connection", async (socket) => {
   // When the Socket Disconnects
   socket.on("disconnect", () => {
     console.log("Client disconnected:", socket.id);
+    clearInterval(keepAlive);
+
     try {
       if (dgConnection.getReadyState() === 1) {
         dgConnection.finish();
