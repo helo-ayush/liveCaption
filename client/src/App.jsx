@@ -4,13 +4,15 @@ import { io } from "socket.io-client";
 const App = () => {
   // Variables Defining
   const socketRef = useRef(null);
-  const mediaRecorderRef = useRef(null);
-  const [finalTranscript, setFinalTranscript] = useState("");
-  const [interimTranscript, setInterimTranscript] = useState("");
+  const audioContextRef = useRef(null);
+  const workletNodeRef = useRef(null);
+  const sourceNodeRef = useRef(null);
+  const streamRef = useRef(null);
+
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState("Disconnected");
 
-  // State for toggling between Hinglish and Original script
+  // State for toggling between Hinglish (translit) and Original Devanagari
   const [showOriginal, setShowOriginal] = useState(false);
 
   // Storage for the full data objects so we can switch views instantly
@@ -21,10 +23,12 @@ const App = () => {
     eng_interim_results: ""
   });
 
+  // Derived display values
+  const finalTranscript = showOriginal ? transcriptData.transcript : transcriptData.eng_transcript;
+  const interimTranscript = showOriginal ? transcriptData.interim_results : transcriptData.eng_interim_results;
+
   // Only Runs for the first time to establish the Socket Connection
   useEffect(() => {
-
-    // Initializing the socket Connection with retryconnection upto infinite time
     const socket = io(import.meta.env.VITE_BACKEND_URL || "http://localhost:3000", {
       reconnection: true,
       reconnectionAttempts: Infinity,
@@ -32,113 +36,120 @@ const App = () => {
       timeout: 10000,
     });
 
-    // Saved the Socket in SocketRef useRef var so it will not keep reinitiallizing
     socketRef.current = socket;
 
-    // Socket quick notifications
     socket.on("connect", () => {
       setStatus("Connected");
       console.log("Connected to server");
     });
 
-    socket.on("dg-ready", () => {
+    socket.on("stt-ready", () => {
       setStatus("Ready");
-      console.log("Deepgram ready");
+      console.log("STT ready");
     });
 
-    // When the socket Returns transcript
     socket.on("transcript", (data) => {
-      // Store the raw data object so we can use it for toggling
       setTranscriptData(data);
     });
 
-    // Notifing the user when socket gets disconnected
     socket.on("disconnect", () => {
       setStatus("Disconnected");
     });
 
-    // Cleaner funtion that will close the socket connection at the end
     return () => {
       socket.disconnect();
-      setIsRecording(false);
+      cleanupAudio();
     };
   }, []); // Run only once on mount
 
-  // Effect to update view when toggle changes
-  useEffect(() => {
-    if (showOriginal) {
-      setFinalTranscript(transcriptData.transcript);
-      setInterimTranscript(transcriptData.interim_results);
-    } else {
-      setFinalTranscript(transcriptData.eng_transcript);
-      setInterimTranscript(transcriptData.eng_interim_results);
-    }
-  }, [showOriginal, transcriptData]);
-
-  // Start Recoding function which records 250ms chunks of the audio from mic input
+  // Start Recording — sets up AudioContext + AudioWorklet for PCM capture
   async function startRecording() {
     try {
-
-      // Checking if the Recording has already started then instead of create new recording, resume it and return
-      if (mediaRecorderRef.current) {
-        mediaRecorderRef.current.resume();
+      // If already set up, just resume the AudioContext
+      if (audioContextRef.current && audioContextRef.current.state === "suspended") {
+        await audioContextRef.current.resume();
         setIsRecording(true);
         setStatus("Recording");
         return;
       }
 
-      //  Creating new recoding Streams input from mic
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      if (!MediaRecorder.isTypeSupported("audio/webm")) {
-        alert("Browser not supported. Please use Chrome or Firefox.");
-        return;
-      }
-
-      // The variable which will actually does the recording, it will be stored inside the useRef so that it wont reinitialize
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: "audio/webm",
+      // Request mic access
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,       // Mono
+          sampleRate: 16000,     // Request 16kHz if supported (browser may override)
+          echoCancellation: true,
+          noiseSuppression: true,
+        }
       });
-      mediaRecorderRef.current = mediaRecorder;
-      mediaRecorder.start(250);  // 250ms audio chunk
+      streamRef.current = stream;
 
-      setIsRecording(true);
-      setStatus("Recording");
+      // Create AudioContext — browser will use its native sample rate
+      // The AudioWorklet processor downsamples to 16kHz internally
+      const audioContext = new AudioContext();
+      audioContextRef.current = audioContext;
 
-      // Builtin ondataavailable function that will run every 250ms
-      mediaRecorder.ondataavailable = async (event) => {
-        if (
-          event.data &&
-          event.data.size > 0 &&
-          socketRef.current?.connected
-        ) {
-          // Convert Blob(250ms Chunk) -> ArrayBuffer so server gets raw bytes
-          const arrayBuffer = await event.data.arrayBuffer();
-          socketRef.current.emit("audio-chunk", arrayBuffer);
+      // Load the PCM processor worklet from /public
+      await audioContext.audioWorklet.addModule("/pcm-processor.js");
+
+      // Create mic source node
+      const sourceNode = audioContext.createMediaStreamSource(stream);
+      sourceNodeRef.current = sourceNode;
+
+      // Create the AudioWorklet node
+      const workletNode = new AudioWorkletNode(audioContext, "pcm-processor");
+      workletNodeRef.current = workletNode;
+
+      // Listen for PCM chunks sent from the worklet
+      workletNode.port.onmessage = (event) => {
+        const pcmBuffer = event.data; // ArrayBuffer of PCM_S16LE bytes
+        if (socketRef.current?.connected) {
+          socketRef.current.emit("audio-chunk", pcmBuffer);
         }
       };
 
-      // Updates variables when recording stop
-      mediaRecorder.onstop = () => {
-        setIsRecording(false);
-        setStatus("Stopped");
-      };
+      // Connect the pipeline: mic → worklet (no output — just processing)
+      sourceNode.connect(workletNode);
+      // NOTE: intentionally NOT connecting workletNode to audioContext.destination
+      // to avoid audio feedback/echo to speakers
+
+      setIsRecording(true);
+      setStatus("Recording");
     } catch (err) {
-      console.error("Mic error:", err);
+      console.error("Mic / AudioContext error:", err);
       setStatus("Mic Error");
     }
   }
 
-  // A function that will pause the mediaRecorder
+  // Stop / Pause — suspends AudioContext (keeps worklet alive, avoids re-setup cost)
   function stopRecording() {
-    if (mediaRecorderRef.current?.state === "recording") {
-      mediaRecorderRef.current.pause();
-      setIsRecording(false);
-      setStatus("Paused");
+    if (audioContextRef.current && audioContextRef.current.state === "running") {
+      audioContextRef.current.suspend();
+    }
+    setIsRecording(false);
+    setStatus("Paused");
+  }
+
+  // Full cleanup — called on component unmount
+  function cleanupAudio() {
+    if (workletNodeRef.current) {
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
+    }
+    if (sourceNodeRef.current) {
+      sourceNodeRef.current.disconnect();
+      sourceNodeRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
     }
   }
 
-  // Switch between Resume and Pause Recording
   const toggleRecording = async () => {
     if (!isRecording) {
       await startRecording();
