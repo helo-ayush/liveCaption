@@ -35,24 +35,24 @@ io.on("connection", async (socket) => {
   console.log("Client connected:", socket.id);
 
   // Variables
-  let eng_transcript = "  ";
+  let eng_transcript = "";
   let transcript = "";
   let eng_interim_results = "";
   let interim_results = "";
 
   // Create Deepgram live connection
-  const dgConnection = deepgram.listen.live({
+ const dgConnection = deepgram.listen.live({
     model: "nova-3",
-    language: "multi", // Detects Hindi/English automatically
+    language: "multi", 
     smart_format: true,
-    punctuate: true,
+    // punctuate: true, // Note: nova-3 usually includes this in smart_format
     interim_results: true,
-    numerals: true,
+    utterance_end_ms: 1000, 
     vad_events: true,
-    endpointing: 400,
-    interim_results: true,
-    utterance_end_ms: 1000,
-  });
+    endpointing: 700, // Increased to give fast talkers more breathing room
+    filler_words: true, // Helps ignore background "clicks" or "ums"
+    no_delay: true // Decreases latency for real-time feel
+});
 
   let keepAlive;
 
@@ -100,6 +100,7 @@ io.on("connection", async (socket) => {
           if (data.channel && data.channel.alternatives && data.channel.alternatives[0]) {
             data.channel.alternatives[0].transcript = hinglishText;
           }
+          console.log(data)
         } catch (e) {
           console.error("Transliteration error:", e);
         }
@@ -169,7 +170,9 @@ io.on("connection", async (socket) => {
 });
 
 
-server.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
 });
 

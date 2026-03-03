@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - FRONTEND_URL=https://live-caption-eta.vercel.app
+      # Add other ENVs here OR use an env_file
+    env_file:
+      - ./server/.env
+    restart: always
