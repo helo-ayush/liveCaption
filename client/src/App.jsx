@@ -4,22 +4,15 @@ import { io } from "socket.io-client";
 const App = () => {
   // Variables Defining
   const socketRef = useRef(null);
-  const mediaRecorderRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const workletNodeRef = useRef(null);
+  const streamRef = useRef(null);
+
   const [finalTranscript, setFinalTranscript] = useState("");
   const [interimTranscript, setInterimTranscript] = useState("");
+  const [vadProcessing, setVadProcessing] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState("Disconnected");
-
-  // State for toggling between Hinglish and Original script
-  const [showOriginal, setShowOriginal] = useState(false);
-
-  // Storage for the full data objects so we can switch views instantly
-  const [transcriptData, setTranscriptData] = useState({
-    transcript: "",
-    eng_transcript: "",
-    interim_results: "",
-    eng_interim_results: ""
-  });
 
   // Only Runs for the first time to establish the Socket Connection
   useEffect(() => {
@@ -41,15 +34,26 @@ const App = () => {
       console.log("Connected to server");
     });
 
-    socket.on("dg-ready", () => {
+    socket.on("sarvam-ready", () => {
       setStatus("Ready");
-      console.log("Deepgram ready");
+      console.log("Sarvam ready");
     });
 
     // When the socket Returns transcript
     socket.on("transcript", (data) => {
-      // Store the raw data object so we can use it for toggling
-      setTranscriptData(data);
+      setFinalTranscript(data.transcript || "");
+      setInterimTranscript(data.interim || "");
+    });
+
+    // When the VAD status changes
+    socket.on("vad-status", (data) => {
+      setVadProcessing(data.isProcessing);
+    });
+
+    // Error from transcription service
+    socket.on("error", (msg) => {
+      console.error("Server error:", msg);
+      setStatus("Error");
     });
 
     // Notifing the user when socket gets disconnected
@@ -64,77 +68,116 @@ const App = () => {
     };
   }, []); // Run only once on mount
 
-  // Effect to update view when toggle changes
-  useEffect(() => {
-    if (showOriginal) {
-      setFinalTranscript(transcriptData.transcript);
-      setInterimTranscript(transcriptData.interim_results);
-    } else {
-      setFinalTranscript(transcriptData.eng_transcript);
-      setInterimTranscript(transcriptData.eng_interim_results);
-    }
-  }, [showOriginal, transcriptData]);
-
-  // Start Recoding function which records 250ms chunks of the audio from mic input
+  // Start Recoding function — captures raw 16kHz PCM from the mic via AudioWorklet
   async function startRecording() {
     try {
 
-      // Checking if the Recording has already started then instead of create new recording, resume it and return
-      if (mediaRecorderRef.current) {
-        mediaRecorderRef.current.resume();
+      // Signal server to create Sarvam connection
+      socketRef.current.emit("start-recording");
+      setStatus("Connecting...");
+
+      // Wait for Sarvam to be ready before capturing audio
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error("Sarvam connection timeout")), 15000);
+        socketRef.current.once("sarvam-ready", () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+        socketRef.current.once("error", (msg) => {
+          clearTimeout(timeout);
+          reject(new Error(msg));
+        });
+      });
+
+      // If AudioContext already exists (paused state), just resume
+      if (audioContextRef.current && audioContextRef.current.state === "suspended") {
+        await audioContextRef.current.resume();
         setIsRecording(true);
         setStatus("Recording");
         return;
       }
 
-      //  Creating new recoding Streams input from mic
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      if (!MediaRecorder.isTypeSupported("audio/webm")) {
-        alert("Browser not supported. Please use Chrome or Firefox.");
-        return;
-      }
-
-      // The variable which will actually does the recording, it will be stored inside the useRef so that it wont reinitialize
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: "audio/webm",
+      //  Creating new recording stream input from mic
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true
+        }
       });
-      mediaRecorderRef.current = mediaRecorder;
-      mediaRecorder.start(250);  // 250ms audio chunk
+      streamRef.current = stream;
+
+      // Create AudioContext at 16kHz for Sarvam compatibility
+      const audioContext = new AudioContext({ sampleRate: 16000 });
+      audioContextRef.current = audioContext;
+
+      // Register the PCM processor worklet
+      const workletCode = `
+        class PCMProcessor extends AudioWorkletProcessor {
+          process(inputs) {
+            const input = inputs[0];
+            if (input && input[0]) {
+              // Convert float32 [-1, 1] samples to int16 PCM
+              const float32 = input[0];
+              const int16 = new Int16Array(float32.length);
+              for (let i = 0; i < float32.length; i++) {
+                const s = Math.max(-1, Math.min(1, float32[i]));
+                int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+              }
+              this.port.postMessage(int16.buffer, [int16.buffer]);
+            }
+            return true;
+          }
+        }
+        registerProcessor('pcm-processor', PCMProcessor);
+      `;
+      const blob = new Blob([workletCode], { type: "application/javascript" });
+      const workletUrl = URL.createObjectURL(blob);
+      await audioContext.audioWorklet.addModule(workletUrl);
+      URL.revokeObjectURL(workletUrl);
+
+      // Create the worklet node to process and send audio chunks
+      const workletNode = new AudioWorkletNode(audioContext, "pcm-processor");
+      workletNodeRef.current = workletNode;
+
+      const source = audioContext.createMediaStreamSource(stream);
+
+      // --- NEW: Add an amplifier (GainNode) to boost low volume audio ---
+      // This happens directly on the client's CPU, costing zero server bandwidth/compute
+      const gainNode = audioContext.createGain();
+      gainNode.gain.value = 2.5; // Multiply volume by 2.5x (adjust as needed)
+
+      // Connect pipeline: Microphone -> Amplifier -> PCM Processor
+      source.connect(gainNode);
+      gainNode.connect(workletNode);
+
+      workletNode.connect(audioContext.destination); // Required to keep processing alive
+
+      // Send PCM chunks to server via socket
+      workletNode.port.onmessage = (event) => {
+        if (socketRef.current?.connected) {
+          socketRef.current.emit("audio-chunk", event.data);
+        }
+      };
 
       setIsRecording(true);
       setStatus("Recording");
 
-      // Builtin ondataavailable function that will run every 250ms
-      mediaRecorder.ondataavailable = async (event) => {
-        if (
-          event.data &&
-          event.data.size > 0 &&
-          socketRef.current?.connected
-        ) {
-          // Convert Blob(250ms Chunk) -> ArrayBuffer so server gets raw bytes
-          const arrayBuffer = await event.data.arrayBuffer();
-          socketRef.current.emit("audio-chunk", arrayBuffer);
-        }
-      };
-
-      // Updates variables when recording stop
-      mediaRecorder.onstop = () => {
-        setIsRecording(false);
-        setStatus("Stopped");
-      };
     } catch (err) {
       console.error("Mic error:", err);
       setStatus("Mic Error");
     }
   }
 
-  // A function that will pause the mediaRecorder
+  // Pause recording by suspending AudioContext and closing Sarvam connection
   function stopRecording() {
-    if (mediaRecorderRef.current?.state === "recording") {
-      mediaRecorderRef.current.pause();
+    if (audioContextRef.current && audioContextRef.current.state === "running") {
+      audioContextRef.current.suspend();
       setIsRecording(false);
       setStatus("Paused");
+      // Signal server to close Sarvam connection
+      socketRef.current?.emit("stop-recording");
     }
   }
 
@@ -175,7 +218,21 @@ const App = () => {
               backgroundColor: status === 'Recording' ? '#ef4444' : (status === 'Ready' || status === 'Connected') ? '#22c55e' : '#9ca3af',
               animation: status === 'Recording' ? 'pulse 1.5s infinite' : 'none'
             }}></div>
-            <span style={{ fontSize: '14px', color: '#666', fontWeight: '500' }}>{status}</span>
+            <span style={{ fontSize: '14px', color: '#666', fontWeight: '500', marginRight: '10px' }}>{status}</span>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              padding: '4px 10px',
+              backgroundColor: vadProcessing ? '#dcfce7' : '#f3f4f6',
+              borderRadius: '16px',
+              fontSize: '12px',
+              fontWeight: '600',
+              color: vadProcessing ? '#166534' : '#6b7280',
+              transition: 'all 0.2s',
+              border: vadProcessing ? '1px solid #bbf7d0' : '1px solid #e5e7eb'
+            }}>
+              VAD: {vadProcessing ? 'Processing (1)' : 'Idle (0)'}
+            </div>
           </div>
         </div>
 
@@ -192,10 +249,10 @@ const App = () => {
           color: '#1f2937'
         }}>
           <span>{finalTranscript}</span>
-          <span style={{ color: '#9ca3af' }}>{interimTranscript}</span>
+          <span style={{ color: '#9ca3af', fontStyle: 'italic' }}>{interimTranscript ? ` ${interimTranscript}` : ""}</span>
         </div>
 
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div style={{ display: 'flex', justifyContent: 'center' }}>
           <button
             onClick={toggleRecording}
             style={{
@@ -212,16 +269,6 @@ const App = () => {
           >
             {isRecording ? "Pause Recording" : "Start Recording"}
           </button>
-
-          <label style={{ display: 'flex', alignItems: 'center', cursor: 'pointer', gap: '10px', fontSize: '14px', color: '#4b5563' }}>
-            <input
-              type="checkbox"
-              checked={showOriginal}
-              onChange={(e) => setShowOriginal(e.target.checked)}
-              style={{ width: '16px', height: '16px', cursor: 'pointer' }}
-            />
-            Show Original Script
-          </label>
         </div>
 
         <style>{`
