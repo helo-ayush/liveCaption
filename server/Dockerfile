@@ -1,19 +1,22 @@
-# Use Node 16 Alpine (lightweight image)
+# Use Node 18 Alpine (lightweight production image)
 FROM node:18-alpine
+
+# Set production environment
+ENV NODE_ENV=production
 
 # Set working directory inside the container
 WORKDIR /app
 
-# Copy package.json and package-lock.json first (for caching)
+# Copy dependency manifests first (Docker layer cache optimization)
 COPY package*.json ./
 
-# Install dependencies
-RUN npm install
+# Install only production dependencies, reproducible via lockfile
+RUN npm ci --omit=dev
 
 # Copy source code
 COPY . .
 
-# Expose default Hugging Face port
+# Default port for Docker deployment (overridable via docker-compose)
 EXPOSE 7860
 
 # Command to run the app

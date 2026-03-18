@@ -1,86 +1,110 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// server.js — Live Caption Backend
+// server.js — Live Caption Backend (Production)
 // Configuration: saaras:v3 model, mode=translit, flush_signal=true
 // ─────────────────────────────────────────────────────────────────────────────
-// HIGHLlGHT FLOW EXPLANATION:
-// 1. Browser captures audio using AudioWorklet and sends raw PCM chunks via Socket.IO.
-// 2. The Node.js server receives these chunks and wraps them in a WAV header.
-// 3. The server sends this WAV-wrapped audio to Sarvam's WebSocket API.
-// 4. Because `flush_signal=true` is set, Sarvam waits for us to tell it when to process the audio.
-// 5. We use a `setInterval` to send a `{"type": "flush"}` command every 2 seconds.
-// 6. When Sarvam receives the flush command, it instantly processes the audio buffer,
-//    generates a transcript, and marks it with `is_final: true`.
-// 7. This gives us highly accurate, complete sentences (Hinglish/translit) every 2 seconds.
+// FLOW:
+// 1. Browser captures audio using AudioWorklet → sends raw PCM chunks via Socket.IO.
+// 2. Server wraps each PCM chunk in a WAV header (Sarvam requires encoding: "audio/wav").
+// 3. Server forwards WAV-wrapped audio to Sarvam's WebSocket API.
+// 4. Because flush_signal=true, we send {"type":"flush"} every 2s to force processing.
+// 5. Sarvam returns transcript chunks → server emits to browser via Socket.IO.
 // ─────────────────────────────────────────────────────────────────────────────
 
 require('dotenv').config();
+
+// ── ENV VALIDATION — fail fast at startup ────────────────────────────────────
+const REQUIRED_ENV = ['SARVAM_API_KEY'];
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`FATAL: Missing required env var: ${key}`);
+    console.error('Copy .env.example to .env and fill in the values.');
+    process.exit(1);
+  }
+}
 
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
+const helmet = require("helmet");
 const WebSocket = require("ws");
 
 const app = express();
 const server = http.createServer(app);
 
-// Allow frontend URL to connect via CORS
-const allowedOrigins = [process.env.FRONTEND_URL || "http://localhost:5173"];
-const corsOptions = { origin: allowedOrigins, methods: ["GET", "POST"], credentials: true };
+// ── SECURITY — helmet sets standard HTTP security headers ────────────────────
+app.use(helmet());
+
+// ── CORS — support multiple origins via comma-separated FRONTEND_URL ─────────
+// Example: FRONTEND_URL=http://localhost:5173,https://live-caption-eta.vercel.app
+const allowedOrigins = (process.env.FRONTEND_URL || "http://localhost:5173")
+  .split(",")
+  .map(o => o.trim());
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow requests with no origin (e.g., server-to-server, curl)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS: origin ${origin} not allowed`));
+    }
+  },
+  methods: ["GET", "POST"],
+  credentials: true
+};
 app.use(cors(corsOptions));
 
+// ── HEALTH CHECK — for Docker, load balancers, and uptime monitors ───────────
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    status: "ok",
+    uptime: Math.floor(process.uptime()),
+    connections: io.engine.clientsCount
+  });
+});
+
 const io = new Server(server, { cors: corsOptions });
+
+// Track active connections for monitoring
+let activeConnections = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Socket.IO — Handles individual frontend connections
 // ─────────────────────────────────────────────────────────────────────────────
 io.on("connection", (socket) => {
-  console.log("Client connected:", socket.id);
+  activeConnections++;
+  console.log(`Client connected: ${socket.id} (active: ${activeConnections})`);
 
   // STATE VARIABLES for this specific connection
-  // `transcript`: Holds the final, committed black text blocks that won't change.
-  // `interim_results`: Holds the current fast/partial gray text (if any).
-  let transcript = "";
-  let interim_results = "";
-
-  // `flushInterval`: The timer ID that triggers the 2-second processing cycle.
-  let flushInterval = null;
-
-  // `hasReceivedAudio`: Prevents us from sending a flush command before the user starts speaking.
+  let transcript = "";        // Final committed black text
+  let interim_results = "";   // Current partial gray text
+  let flushInterval = null;   // Timer ID for periodic flush
   let hasReceivedAudio = false;
 
   // 1. CONSTRUCT WEBSOCKET URL
-  // We manually build the URL to pass specific query parameters to Sarvam.
-  // Crucially, `flush_signal=true` puts us in manual control of when transcripts are locked in.
   const SARVAM_KEY = process.env.SARVAM_API_KEY;
   const sarvamUrl =
     "wss://api.sarvam.ai/speech-to-text/ws" +
-    "?model=saaras:v3" +     // High accuracy model
-    "&mode=translit" +       // Output in Romanized Hindi (Hinglish) instead of Devanagari script
-    "&language-code=hi-IN" + // Hint that the speaker is speaking Indian languages
-    "&sample_rate=16000" +   // Standard sample rate used by our frontend audio processor
-    "&flush_signal=true";    // Tell Sarvam we will manually trigger processing via "flush" messages
+    "?model=saaras:v3" +
+    "&mode=translit" +
+    "&language-code=hi-IN" +
+    "&sample_rate=16000" +
+    "&flush_signal=true";
 
-  console.log("Connecting to:", sarvamUrl);
+  console.log("Connecting to Sarvam for client:", socket.id);
 
   // 2. CONNECT TO SARVAM
-  // We pass the API key as a "subprotocol" in the WebSocket array header.
-  // This is required by Sarvam's streaming API architecture instead of standard HTTP Auth headers.
+  // API key passed as WebSocket subprotocol (required by Sarvam's architecture)
   const sarvamWs = new WebSocket(sarvamUrl, [`api-subscription-key.${SARVAM_KEY}`]);
 
   // 3. HANDLE SUCCESSFUL CONNECTION
   sarvamWs.on("open", () => {
     console.log("Sarvam connected for client:", socket.id);
-    // Tell the frontend that we are ready to receive audio!
     socket.emit("stt-ready");
 
-    // ── PERIODIC FLUSH LOGIC ──────────────────────────────────────────────────
-    // Because we set `flush_signal=true`, Sarvam just buffers the audio forever.
-    // Every 2 seconds (2000ms), we ping Sarvam with a "flush" message.
-    // This tells Sarvam: "Process the audio you have buffered RIGHT NOW and give me the transcript."
-    // 2000ms gives the AI enough context (a few words) to accurately transcribe the Hinglish text.
+    // Periodic flush: force Sarvam to process buffered audio every 2 seconds
     flushInterval = setInterval(() => {
-      // We only flush if the connection is active AND the frontend actually sent some audio bytes.
       if (sarvamWs.readyState === WebSocket.OPEN && hasReceivedAudio) {
         sarvamWs.send(JSON.stringify({ type: "flush" }));
       }
@@ -93,37 +117,26 @@ io.on("connection", (socket) => {
     try { data = JSON.parse(rawData.toString()); }
     catch (e) { return; }
 
-    console.log("Sarvam:", JSON.stringify(data));
-
-    // Handle authentication or internal Sarvam errors
     if (data.type === "error") {
       console.error("Sarvam error:", data.data?.message);
       return;
     }
 
-    // `type: "end"` normally indicates a natural pause, but with flush_signal we mainly rely on "data"
     if (data.type === "end") {
       if (interim_results) {
         transcript += (transcript ? " " : "") + interim_results;
         interim_results = "";
         console.log("FINAL (end):", transcript);
       }
-    }
-    // `type: "data"` contains actual transcript blobs
-    else if (data.type === "data") {
+    } else if (data.type === "data") {
       const text = data.data?.transcript || "";
       if (!text) return;
 
-      // When we trigger a manual `flush`, Sarvam returns the chunk of text with `is_final: true`.
-      // This means this block of text is highly confident and won't change anymore, so we lock it in.
       if (data.data.is_final) {
-        transcript += (transcript ? " " : "") + text; // Append to main black text
-        interim_results = "";                         // Clear any gray pending text
+        transcript += (transcript ? " " : "") + text;
+        interim_results = "";
         console.log("FINAL (flushed):", text);
-      }
-      // If `is_final` is false, this is a very fast partial guess (interim).
-      // We keep it as gray text until the next flush confirms it.
-      else {
+      } else {
         interim_results = text;
         console.log("INTERIM:", text);
       }
@@ -131,10 +144,6 @@ io.on("connection", (socket) => {
       return;
     }
 
-    // 5. SEND UPDATES TO FRONTEND
-    // Both `transcript` (black) and `interim_results` (gray) are sent.
-    // Because we use `mode=translit`, there is no difference between native and english translation,
-    // so we duplicate the values into the `eng_` variables to keep the UI happy.
     socket.emit("transcript", {
       transcript,
       eng_transcript: transcript,
@@ -144,29 +153,21 @@ io.on("connection", (socket) => {
   });
 
   sarvamWs.on("error", (err) => {
-    console.error("Sarvam error for client", socket.id, ":", err.message);
+    console.error("Sarvam WS error for client", socket.id, ":", err.message);
   });
 
   sarvamWs.on("close", (code) => {
     console.log(`Sarvam closed for client ${socket.id} — code: ${code}`);
-    // Stop the 2-second timer to prevent memory leaks when the connection ends.
     if (flushInterval) clearInterval(flushInterval);
   });
 
-  // 6. PROCESS INCOMING AUDIO FROM FRONTEND
+  // 5. PROCESS INCOMING AUDIO FROM FRONTEND
   socket.on("audio-chunk", (chunk) => {
-    // Make sure the outward Sarvam socket is open
     if (sarvamWs.readyState === WebSocket.OPEN && chunk) {
-
-      // Mark that audio has started so our flush timer is allowed to fire
       hasReceivedAudio = true;
 
-      // Even though the URL says &input_audio_codec=pcm_s16le, the Sarvam WebSocket
-      // pipeline strictly validates the JSON payload property `encoding` to be "audio/wav".
-      // We must wrap the raw PCM chunk in a WAV header to satisfy their backend.
+      // Wrap raw PCM in WAV header (Sarvam requires encoding: "audio/wav")
       const wavBuffer = pcmToWav(Buffer.from(chunk));
-
-      // Send the wrapped payload
       sarvamWs.send(JSON.stringify({
         audio: {
           data: wavBuffer.toString("base64"),
@@ -177,38 +178,69 @@ io.on("connection", (socket) => {
     }
   });
 
-  // 7. HANDLE CLEANUP ON DISCONNECT
+  // 6. CLEANUP ON DISCONNECT
   socket.on("disconnect", () => {
-    console.log("Client disconnected:", socket.id);
-    if (flushInterval) clearInterval(flushInterval);      // Clean up timer
-    if (sarvamWs.readyState === WebSocket.OPEN) sarvamWs.close(); // Clean up socket connecting to Sarvam
+    activeConnections--;
+    console.log(`Client disconnected: ${socket.id} (active: ${activeConnections})`);
+    if (flushInterval) clearInterval(flushInterval);
+    if (sarvamWs.readyState === WebSocket.OPEN) sarvamWs.close();
   });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AUDIO FORMATTER UTILITY
-// Prepend a standard 44-byte WAV specific header to the raw audio buffer
-// This is required because Sarvam's API requires valid WAV files, not raw streams.
+// AUDIO FORMATTER — Prepend 44-byte WAV header to raw PCM_S16LE data
 // ─────────────────────────────────────────────────────────────────────────────
 function pcmToWav(pcmBuffer, sampleRate = 16000, numChannels = 1, bitDepth = 16) {
   const dataLength = pcmBuffer.length;
   const header = Buffer.alloc(44);
-  header.write("RIFF", 0);                               // ChunkID
-  header.writeUInt32LE(36 + dataLength, 4);              // ChunkSize
-  header.write("WAVE", 8);                               // Format
-  header.write("fmt ", 12);                              // Subchunk1ID
-  header.writeUInt32LE(16, 16);                          // Subchunk1Size
-  header.writeUInt16LE(1, 20);                           // AudioFormat (1 = PCM)
-  header.writeUInt16LE(numChannels, 22);                 // NumChannels
-  header.writeUInt32LE(sampleRate, 24);                  // SampleRate
-  header.writeUInt32LE(sampleRate * numChannels * bitDepth / 8, 28); // ByteRate
-  header.writeUInt16LE(numChannels * bitDepth / 8, 32);  // BlockAlign
-  header.writeUInt16LE(bitDepth, 34);                    // BitsPerSample
-  header.write("data", 36);                              // Subchunk2ID
-  header.writeUInt32LE(dataLength, 40);                  // Subchunk2Size
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataLength, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * numChannels * bitDepth / 8, 28);
+  header.writeUInt16LE(numChannels * bitDepth / 8, 32);
+  header.writeUInt16LE(bitDepth, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(dataLength, 40);
   return Buffer.concat([header, pcmBuffer]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GRACEFUL SHUTDOWN — cleanly close all connections on SIGTERM/SIGINT
+// Docker sends SIGTERM when stopping containers. Without this handler,
+// active WebSocket sessions are killed abruptly.
+// ─────────────────────────────────────────────────────────────────────────────
+function gracefulShutdown(signal) {
+  console.log(`\n${signal} received. Shutting down gracefully...`);
+
+  // Stop accepting new connections
+  server.close(() => {
+    console.log("HTTP server closed.");
+    process.exit(0);
+  });
+
+  // Close all Socket.IO connections
+  io.close(() => {
+    console.log("Socket.IO connections closed.");
+  });
+
+  // Force exit after 10 seconds if graceful shutdown stalls
+  setTimeout(() => {
+    console.error("Forced shutdown after timeout.");
+    process.exit(1);
+  }, 10000);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+// ─────────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Allowed origins: ${allowedOrigins.join(", ")}`);
+});

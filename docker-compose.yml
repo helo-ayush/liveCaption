@@ -1,15 +1,21 @@
-version: '3.8'
-
 services:
   backend:
     build:
       context: ./server
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "7860:7860"
     environment:
-      - FRONTEND_URL=https://live-caption-eta.vercel.app
-      # Add other ENVs here OR use an env_file
+      # Override .env PORT for Docker — avoids conflict with local dev (port 3000)
+      - PORT=7860
+      # Set your production frontend URL here
+      # - FRONTEND_URL=https://your-frontend.vercel.app
     env_file:
       - ./server/.env
     restart: always
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:7860/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
