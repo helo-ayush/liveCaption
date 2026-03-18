@@ -153,3 +153,64 @@ socket.on("error", (msg) => {
 });
 ```
 **`error` Returns**: `String` // The error message description.
+
+---
+
+## 🛠️ Project Setup & Installation
+
+Before running the project locally or via Docker, you must set up the environment variables. The `.env` files have been removed from source control for security. You will need to create them manually.
+
+### 1. Environment Setup
+
+**For the Server:**
+Create a `.env` file inside the `server/` directory:
+```env
+SARVAM_API_KEY=your_sarvam_api_key_here
+FRONTEND_URL=http://localhost:5173
+PORT=3000
+```
+
+**For the Client:**
+Create a `.env` file inside the `client/` directory:
+```env
+VITE_BACKEND_URL=http://localhost:3000
+```
+
+---
+
+### 2. Running Locally (Without Docker)
+
+If you prefer to run both the frontend and backend directly on your machine, follow these steps:
+
+#### Terminal 1: Start the Backend
+```bash
+cd server
+npm install
+npm run dev
+# The server will start on http://localhost:3000
+```
+
+#### Terminal 2: Start the Frontend
+```bash
+cd client
+npm install
+npm run dev
+# The client will start on http://localhost:5173
+```
+
+---
+
+### 3. Running with Docker (Server Only)
+
+The Docker configuration is isolated to the `server` folder. You can containerize the backend while running the frontend locally, or you can host them separately.
+
+#### Start the Dockerized Backend:
+Make sure you have Docker and Docker Compose installed, then run:
+
+```bash
+cd server
+docker-compose up --build
+```
+The backend API will now be accessible at `http://localhost:3000`.
+
+*Note: The frontend (inside the `client` folder) is currently not dockerized and should be run locally using the steps in the previous section, or deployed to a static host like Vercel.*
