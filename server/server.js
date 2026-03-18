@@ -24,6 +24,11 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
+// Basic health check/greeting endpoint
+app.get("/", (req, res) => {
+  res.status(200).send("Live Caption API Server is running!");
+});
+
 const io = new Server(server, {
   cors: corsOptions,
 });
