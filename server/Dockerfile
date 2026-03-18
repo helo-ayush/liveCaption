@@ -1,4 +1,4 @@
-# Use Node 16 Alpine (lightweight image)
+# Use Node 18 Alpine (lightweight image)
 FROM node:18-alpine
 
 # Set working directory inside the container
@@ -13,8 +13,8 @@ RUN npm install
 # Copy source code
 COPY . .
 
-# Expose default Hugging Face port
-EXPOSE 7860
+# Expose port
+EXPOSE 3000
 
 # Command to run the app
 CMD ["npm", "start"]
